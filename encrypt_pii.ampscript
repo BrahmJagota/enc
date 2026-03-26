@@ -1,0 +1,117 @@
+%%[
+
+/*
+============================================================
+  SFMC AMPscript — PII Encryption
+  File   : encrypt_pii.ampscript
+  Purpose: Encrypt customer PII (email, phone, etc.) using
+           AES-256-CBC via SFMC's built-in EncryptSymmetric()
+           before storing or passing downstream.
+
+  Algorithm : AES-256-CBC  (what SFMC's EncryptSymmetric uses)
+  Key source: SFMC Symmetric Key  — stored in:
+              Admin > Security > Symmetric Key Management
+              Key name: "PII_AES_KEY"   ← match this in Server B
+
+  Output    : Base64-encoded ciphertext string — safe for
+              Data Extension fields, query strings, HTTP payloads.
+
+  NEVER log or store raw PII after this block runs.
+============================================================
+*/
+
+/* ── 1. Raw PII values (from subscriber attributes / DE lookup) ── */
+SET @email     = AttributeValue("EmailAddress")
+SET @phone     = AttributeValue("MobileNumber")
+SET @firstName = AttributeValue("FirstName")
+SET @lastName  = AttributeValue("LastName")
+
+/*
+  You can also pull from a Data Extension row:
+  SET @row      = LookupRows("ContactDE","SubscriberKey", _subscriberkey)
+  SET @email    = Field(Row(@row,1),"EmailAddress")
+*/
+
+/* ── 2. Encrypt each PII field ── */
+/*
+  EncryptSymmetric(value, algorithm, [keyname, key, saltname, salt, ivname, iv])
+
+  We use the named key approach — the actual key bytes live in SFMC
+  Key Management, never hard-coded here.
+
+  Parameters:
+    "aes256"         → AES-256-CBC cipher
+    @keyName         → references the Symmetric Key stored in SFMC
+    @empty, @empty   → no external key value (use stored key)
+    @saltName        → references the Salt stored in SFMC Key Mgmt
+    @empty, @empty   → no external salt value
+    @empty, @empty   → let SFMC generate/manage the IV
+*/
+
+SET @keyName  = "PII_AES_KEY"      /* Name in SFMC Symmetric Key Management */
+SET @saltName = "PII_AES_SALT"     /* Name in SFMC Symmetric Key Management */
+SET @empty    = ""
+
+SET @encEmail     = EncryptSymmetric(@email,     "aes256", @keyName, @empty, @saltName, @empty, @empty, @empty)
+SET @encPhone     = EncryptSymmetric(@phone,     "aes256", @keyName, @empty, @saltName, @empty, @empty, @empty)
+SET @encFirstName = EncryptSymmetric(@firstName, "aes256", @keyName, @empty, @saltName, @empty, @empty, @empty)
+SET @encLastName  = EncryptSymmetric(@lastName,  "aes256", @keyName, @empty, @saltName, @empty, @empty, @empty)
+
+/* ── 3. Store encrypted values back to a secure Data Extension ── */
+/*
+  DE "Encrypted_Contacts" schema:
+    SubscriberKey   Text(50)  PK
+    EncEmail        Text(500)
+    EncPhone        Text(500)
+    EncFirstName    Text(500)
+    EncLastName     Text(500)
+    EncryptedAt     Date
+*/
+SET @upsertResult = UpsertData(
+  "Encrypted_Contacts",
+  1,                         "SubscriberKey", _subscriberkey,
+  "EncEmail",                @encEmail,
+  "EncPhone",                @encPhone,
+  "EncFirstName",            @encFirstName,
+  "EncLastName",             @encLastName,
+  "EncryptedAt",             Now()
+)
+
+/* ── 4. Optional: build a JSON payload to POST to Server B ── */
+SET @jsonPayload = Concat(
+  "{",
+    """subscriberKey"":"  , """", _subscriberkey, """,",
+    """encEmail"":"       , """", @encEmail,       """,",
+    """encPhone"":"       , """", @encPhone,       """,",
+    """encFirstName"":"   , """", @encFirstName,   """,",
+    """encLastName"":"    , """", @encLastName,    """",
+  "}"
+)
+
+/* ── 5. Optional: HTTP POST the encrypted payload to Server B ── */
+/*
+  Uncomment to send the payload to your external decryption server.
+  Server B will decrypt using Node.js (see serverB_sfmc_decrypt.js).
+
+  SET @endpoint  = "https://your-server-b.example.com/decrypt-pii"
+  SET @headerStr = Concat("Content-Type: application/json\r\nX-Api-Key: YOUR_API_KEY")
+  SET @httpResult = HTTPPost2(@endpoint, "application/json", @jsonPayload, false, @headerStr, @httpStatus)
+*/
+
+]%%
+
+<!-- ══════════════════════════════════════════════════════════════
+     Optional: render masked values in a confirmation email
+     Show ONLY last 4 chars of phone — never show raw or encrypted PII
+     ══════════════════════════════════════════════════════════════ -->
+
+<p>Your details have been securely saved.</p>
+<p>Phone on file: ••••••%%=v(@phone, "right", 4)=%%</p>
+
+<!--
+  DEBUG BLOCK — remove entirely before deploying to production.
+  Never render encrypted values in email body (email logs are not secure).
+
+  Encrypted email : %%=v(@encEmail)=%%
+  Encrypted phone : %%=v(@encPhone)=%%
+-->
